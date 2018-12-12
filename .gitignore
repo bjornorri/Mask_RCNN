@@ -1,3 +1,5 @@
+.DS_Store
+*.swp
 # Data files and directories common in repo root
 datasets/
 logs/

@@ -21,8 +21,36 @@ Usage: import the module (see Jupyter notebooks for examples), or run from
 import os
 import sys
 import datetime
+import subprocess
+import random
 import numpy as np
 import skimage.draw
+
+# Hack CUDA_VISIBLE_DEVICES to always find available GPUs
+cmd = "nvidia-smi | awk '{print $2}' | awk '/Processes:/{y=1;next}y' | awk '/GPU/{y=1;next}y'"
+output = subprocess.check_output(cmd, shell=True).decode('utf-8').strip()
+
+used_gpus = set([int(s) for s in output.split('\n')])
+all_gpus = set(range(8))
+available_gpus = all_gpus - used_gpus
+
+if len(available_gpus) == 0:
+    print('No GPUs!')
+    sys.exit(0)
+
+print('Found GPUs: {}'.format(','.join([str(gpu) for gpu in available_gpus])))
+
+# Leave some available
+gpus = list(available_gpus)
+max_gpus = 2
+if len(gpus) > max_gpus:
+    gpus = gpus[:max_gpus]
+
+# Set the environment variable
+visible_devices = ','.join([str(i) for i in gpus])
+os.environ["CUDA_VISIBLE_DEVICES"] = visible_devices
+
+print('Using GPUs: {}'.format(visible_devices))
 
 # Root directory of the project
 ROOT_DIR = os.path.abspath("../../")
@@ -30,8 +58,12 @@ ROOT_DIR = os.path.abspath("../../")
 # Import Mask RCNN
 sys.path.append(ROOT_DIR)  # To find local version of the library
 
+
 from mrcnn.config import Config
-from mrcnn import model as modellib, utils
+from mrcnn import model as modellib
+from mrcnn import utils
+from mrcnn import visualize
+
 
 # Path to trained weights file
 COCO_WEIGHTS_PATH = os.path.join(ROOT_DIR, "mask_rcnn_coco.h5")
@@ -39,6 +71,12 @@ COCO_WEIGHTS_PATH = os.path.join(ROOT_DIR, "mask_rcnn_coco.h5")
 # Directory to save logs and model checkpoints, if not provided
 # through the command line argument --logs
 DEFAULT_LOGS_DIR = os.path.join(ROOT_DIR, "logs")
+
+# NUM_SAMPLES = 2821
+NUM_SAMPLES = 427
+TRAIN_SPLIT = 1.0
+RESULTS_DIR = os.path.join(ROOT_DIR, "/local/home/bjornorri/results/microfibers")
+
 
 ############################################################
 #  Configurations
@@ -52,6 +90,8 @@ class MicrofiberConfig(Config):
     # Give the configuration a recognizable name
     NAME = "microfiber"
 
+    GPU_COUNT = len(gpus)
+
     # We use a GPU with 12GB memory, which can fit two images.
     # Adjust down if you use a smaller GPU.
     IMAGES_PER_GPU = 1
@@ -59,11 +99,36 @@ class MicrofiberConfig(Config):
     # Number of classes (including background)
     NUM_CLASSES = 1 + 1  # Background + microfiber
 
+    num_samples = NUM_SAMPLES
+    # num_samples = 200
     # Number of training steps per epoch
-    STEPS_PER_EPOCH = 100
+    EPOCHS = 200
+    STEPS_PER_EPOCH = int(TRAIN_SPLIT * num_samples)
+    # STEPS_PER_EPOCH = 100
+
+    # VALIDATION_STEPS = min(num_samples - STEPS_PER_EPOCH, 10)
+    VALIDATION_STEPS = 10
 
     # Skip detections with < 90% confidence
-    DETECTION_MIN_CONFIDENCE = 0.9
+    DETECTION_MIN_CONFIDENCE = 0.7
+
+    BACKBONE = "resnet50"
+
+    # Can't afford mini-mask since the fibers are small
+    # USE_MINI_MASK = False
+
+    IMAGE_MIN_DIM = 512
+    IMAGE_MAX_DIM = 512
+
+    # Reduce number of units in classification layer
+    # FPN_CLASSIF_FC_LAYERS_SIZE = 256
+
+    # Faster learning rate
+    LEARNING_RATE = 0.01
+    # LEARNING_RATE = 0.1
+
+    # RPN_NMS_THRESHOLD = 0.99
+    # DETECTION_NMS_THRESHOLD = 0.99
 
 
 ############################################################
@@ -84,8 +149,19 @@ class MicrofiberDataset(utils.Dataset):
         samples = [d for d in os.listdir(dataset_dir) if os.path.isdir(os.path.join(dataset_dir, d))]
         sample_paths = [os.path.join(dataset_dir, s) for s in samples]
 
+        random.Random(37).shuffle(sample_paths)
+        sample_paths = sample_paths[:NUM_SAMPLES]
+
+        index = int(TRAIN_SPLIT * len(sample_paths))
+
+        # if subset == 'train':
+            # sample_paths = sample_paths[:index]
+        # elif subset == 'val':
+            # sample_paths = sample_paths[index:]
+
         # Add each image.
-        for name, path in zip(samples, sample_paths):
+        for path in sample_paths:
+            name = path.split('/')[-1]
             image_path = os.path.join(path, 'image.png')
             self.add_image("microfiber", image_id=name, path=image_path)
 
@@ -104,7 +180,14 @@ class MicrofiberDataset(utils.Dataset):
         info = self.image_info[image_id]
         mask_dir = os.path.join(os.path.dirname(info["path"]), 'masks')
         mask_files = [os.path.join(mask_dir, f) for f in os.listdir(mask_dir) if f.endswith('.png')]
-        masks = np.array([skimage.io.imread(f) for f in mask_files])
+        masks = [skimage.io.imread(f) for f in mask_files]
+
+        # Generate an empty mask if no masks are found.
+        if len(masks) == 0:
+            mask = np.zeros((512, 512))
+            masks.append(mask)
+
+        masks = np.array(masks)
         masks = np.moveaxis(masks, 0, -1)
 
         return masks.astype(np.bool), np.ones([masks.shape[-1]], dtype=np.int32)
@@ -118,6 +201,9 @@ class MicrofiberDataset(utils.Dataset):
             super(self.__class__, self).image_reference(image_id)
 
 
+############################################################
+#  Training
+############################################################
 def train(model):
     """Train the model."""
     # Training dataset.
@@ -130,95 +216,137 @@ def train(model):
     dataset_val.load_microfiber(args.dataset, "val")
     dataset_val.prepare()
 
-    # *** This training schedule is an example. Update to your needs ***
-    # Since we're using a very small dataset, and starting from
-    # COCO trained weights, we don't need to train too long. Also,
-    # no need to train all layers, just the heads should do it.
-    print("Training network heads")
+    # Train the head branches
+    # Passing layers="heads" freezes all layers except the head
+    # layers. You can also pass a regular expression to select
+    # which layers to train by name pattern.
+    # print("Training network heads")
+    # model.train(dataset_train, dataset_val,
+                # learning_rate=config.LEARNING_RATE,
+                # epochs=1,
+                # layers='heads')
+
+    print("Training all layers")
+    # Fine tune all layers
+    # Passing layers="all" trains all layers. You can also
+    # pass a regular expression to select which layers to
+    # train by name pattern.
     model.train(dataset_train, dataset_val,
-                learning_rate=config.LEARNING_RATE,
-                epochs=30,
-                layers='heads')
+                learning_rate=config.LEARNING_RATE / 10,
+                epochs=config.EPOCHS,
+                layers="all")
 
 
-def color_splash(image, mask):
-    """Apply color splash effect.
-    image: RGB image [height, width, 3]
-    mask: instance segmentation mask [height, width, instance count]
+############################################################
+#  RLE Encoding
+############################################################
 
-    Returns result image.
+def rle_encode(mask):
+    """Encodes a mask in Run Length Encoding (RLE).
+    Returns a string of space-separated values.
     """
-    # Make a grayscale copy of the image. The grayscale copy still
-    # has 3 RGB channels, though.
-    gray = skimage.color.gray2rgb(skimage.color.rgb2gray(image)) * 255
-    # Copy color pixels from the original color image where mask is set
-    if mask.shape[-1] > 0:
-        # We're treating all instances as one, so collapse the mask into one layer
-        mask = (np.sum(mask, -1, keepdims=True) >= 1)
-        splash = np.where(mask, image, gray).astype(np.uint8)
-    else:
-        splash = gray.astype(np.uint8)
-    return splash
+    assert mask.ndim == 2, "Mask must be of shape [Height, Width]"
+    # Flatten it column wise
+    m = mask.T.flatten()
+    # Compute gradient. Equals 1 or -1 at transition points
+    g = np.diff(np.concatenate([[0], m, [0]]), n=1)
+    # 1-based indicies of transition points (where gradient != 0)
+    rle = np.where(g != 0)[0].reshape([-1, 2]) + 1
+    # Convert second index in each pair to lenth
+    rle[:, 1] = rle[:, 1] - rle[:, 0]
+    return " ".join(map(str, rle.flatten()))
 
 
-def detect_and_color_splash(model, image_path=None, video_path=None):
-    assert image_path or video_path
+def rle_decode(rle, shape):
+    """Decodes an RLE encoded list of space separated
+    numbers and returns a binary mask."""
+    rle = list(map(int, rle.split()))
+    rle = np.array(rle, dtype=np.int32).reshape([-1, 2])
+    rle[:, 1] += rle[:, 0]
+    rle -= 1
+    mask = np.zeros([shape[0] * shape[1]], np.bool)
+    for s, e in rle:
+        assert 0 <= s < mask.shape[0]
+        assert 1 <= e <= mask.shape[0], "shape: {}  s {}  e {}".format(shape, s, e)
+        mask[s:e] = 1
+    # Reshape and transpose
+    mask = mask.reshape([shape[1], shape[0]]).T
+    return mask
 
-    # Image or video?
-    if image_path:
-        # Run model detection and generate the color splash effect
-        print("Running on {}".format(args.image))
-        # Read image
-        image = skimage.io.imread(args.image)
+
+def mask_to_rle(image_id, mask, scores):
+    "Encodes instance masks to submission format."
+    assert mask.ndim == 3, "Mask must be [H, W, count]"
+    # If mask is empty, return line with image ID only
+    if mask.shape[-1] == 0:
+        return "{},".format(image_id)
+    # Remove mask overlaps
+    # Multiply each instance mask by its score order
+    # then take the maximum across the last dimension
+    order = np.argsort(scores)[::-1] + 1  # 1-based descending
+    mask = np.max(mask * np.reshape(order, [1, 1, -1]), -1)
+    # Loop over instance masks
+    lines = []
+    for o in order:
+        m = np.where(mask == o, 1, 0)
+        # Skip if empty
+        if m.sum() == 0.0:
+            continue
+        rle = rle_encode(m)
+        lines.append("{}, {}".format(image_id, rle))
+    return "\n".join(lines)
+
+############################################################
+#  Segmentation
+############################################################
+
+
+def segment(model, dataset_dir):
+    print("Segmenting images")
+
+    # Create directory
+    if not os.path.exists(RESULTS_DIR):
+        os.makedirs(RESULTS_DIR)
+    submit_dir = "submit_{:%Y%m%dT%H%M%S}".format(datetime.datetime.now())
+    submit_dir = os.path.join(RESULTS_DIR, submit_dir)
+    os.makedirs(submit_dir)
+
+    # Read dataset
+    dataset = MicrofiberDataset()
+    dataset.load_microfiber(dataset_dir, 'val')
+    dataset.prepare()
+    # Load over images
+    submission = []
+    for image_id in dataset.image_ids:
+        # Load image and run detection
+        image = dataset.load_image(image_id)
         # Detect objects
-        r = model.detect([image], verbose=1)[0]
-        # Color splash
-        splash = color_splash(image, r['masks'])
-        # Save output
-        file_name = "splash_{:%Y%m%dT%H%M%S}.png".format(datetime.datetime.now())
-        skimage.io.imsave(file_name, splash)
-    elif video_path:
-        import cv2
-        # Video capture
-        vcapture = cv2.VideoCapture(video_path)
-        width = int(vcapture.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(vcapture.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = vcapture.get(cv2.CAP_PROP_FPS)
+        r = model.detect([image], verbose=0)[0]
+        # Encode image to RLE. Returns a string of multiple lines
+        source_id = dataset.image_info[image_id]["id"]
+        rle = mask_to_rle(source_id, r["masks"], r["scores"])
+        submission.append(rle)
+        # Save image with masks
+        visualize.display_instances(
+            image, r['rois'], r['masks'], r['class_ids'],
+            dataset.class_names, r['scores'],
+            show_bbox=True, show_mask=False,
+            title="Predictions")
+        plt.savefig("{}/{}.png".format(submit_dir, dataset.image_info[image_id]["id"]))
 
-        # Define codec and create video writer
-        file_name = "splash_{:%Y%m%dT%H%M%S}.avi".format(datetime.datetime.now())
-        vwriter = cv2.VideoWriter(file_name,
-                                  cv2.VideoWriter_fourcc(*'MJPG'),
-                                  fps, (width, height))
+    # Save to csv file
+    submission = "ImageId,EncodedPixels\n" + "\n".join(submission)
+    file_path = os.path.join(submit_dir, "submit.csv")
+    with open(file_path, "w") as f:
+        f.write(submission)
+    print("Saved to ", submit_dir)
 
-        count = 0
-        success = True
-        while success:
-            print("frame: ", count)
-            # Read next image
-            success, image = vcapture.read()
-            if success:
-                # OpenCV returns images as BGR, convert to RGB
-                image = image[..., ::-1]
-                # Detect objects
-                r = model.detect([image], verbose=0)[0]
-                # Color splash
-                splash = color_splash(image, r['masks'])
-                # RGB -> BGR to save image to video
-                splash = splash[..., ::-1]
-                # Add image to video writer
-                vwriter.write(splash)
-                count += 1
-        vwriter.release()
-    print("Saved to ", file_name)
-
-
-############################################################
-#  Training
-############################################################
 
 if __name__ == '__main__':
     import argparse
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
 
     # Parse command line arguments
     parser = argparse.ArgumentParser(
@@ -247,9 +375,8 @@ if __name__ == '__main__':
     # Validate arguments
     if args.command == "train":
         assert args.dataset, "Argument --dataset is required for training"
-    elif args.command == "splash":
-        assert args.image or args.video,\
-            "Provide --image or --video to apply color splash"
+    elif args.command == "segment":
+        assert args.dataset
 
     print("Weights: ", args.weights)
     print("Dataset: ", args.dataset)
@@ -304,9 +431,8 @@ if __name__ == '__main__':
     # Train or evaluate
     if args.command == "train":
         train(model)
-    elif args.command == "splash":
-        detect_and_color_splash(model, image_path=args.image,
-                                video_path=args.video)
+    elif args.command == "segment":
+        segment(model, dataset_dir=args.dataset)
     else:
         print("'{}' is not recognized. "
-              "Use 'train' or 'splash'".format(args.command))
+              "Use 'train' or 'segment'".format(args.command))

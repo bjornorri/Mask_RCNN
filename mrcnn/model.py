@@ -31,6 +31,7 @@ assert LooseVersion(tf.__version__) >= LooseVersion("1.3")
 assert LooseVersion(keras.__version__) >= LooseVersion('2.0.8')
 
 
+
 ############################################################
 #  Utility Functions
 ############################################################
@@ -2186,6 +2187,7 @@ class MaskRCNN():
         # Compile
         self.keras_model.compile(
             optimizer=optimizer,
+            metrics=['accuracy'],
             loss=[None] * len(self.keras_model.outputs))
 
         # Add metrics for losses
@@ -2371,8 +2373,8 @@ class MaskRCNN():
             validation_data=val_generator,
             validation_steps=self.config.VALIDATION_STEPS,
             max_queue_size=100,
-            workers=workers,
-            use_multiprocessing=True,
+            workers=1,
+            use_multiprocessing=False,
         )
         self.epoch = max(self.epoch, epochs)
 
