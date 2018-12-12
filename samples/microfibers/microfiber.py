@@ -124,7 +124,7 @@ class MicrofiberConfig(Config):
     # FPN_CLASSIF_FC_LAYERS_SIZE = 256
 
     # Faster learning rate
-    LEARNING_RATE = 0.01
+    LEARNING_RATE = 0.001
     # LEARNING_RATE = 0.1
 
     # RPN_NMS_THRESHOLD = 0.99
