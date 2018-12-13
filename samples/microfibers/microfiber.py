@@ -42,7 +42,7 @@ print('Found GPUs: {}'.format(','.join([str(gpu) for gpu in available_gpus])))
 
 # Leave some available
 gpus = list(available_gpus)
-max_gpus = 2
+max_gpus = 3
 if len(gpus) > max_gpus:
     gpus = gpus[:max_gpus]
 
@@ -301,8 +301,18 @@ def mask_to_rle(image_id, mask, scores):
 ############################################################
 
 
-def segment(model, dataset_dir):
+def segment(model, dataset_dir, stats=True):
     print("Segmenting images")
+
+    if stats:
+        def iou(a, b):
+            intersection = (np.logical_and(a, b) == 1).sum()
+            union = (np.logical_or(a, b) == 1).sum()
+            return intersection / union
+
+        total_fibers = 0
+        total_found = 0
+        iou_values = []
 
     # Create directory
     if not os.path.exists(RESULTS_DIR):
@@ -317,7 +327,8 @@ def segment(model, dataset_dir):
     dataset.prepare()
     # Load over images
     submission = []
-    for image_id in dataset.image_ids:
+    for n, image_id in enumerate(dataset.image_ids):
+        print("Image {} / {}".format(n + 1, len(dataset.image_ids)))
         # Load image and run detection
         image = dataset.load_image(image_id)
         # Detect objects
@@ -334,57 +345,36 @@ def segment(model, dataset_dir):
             title="Predictions")
         plt.savefig("{}/{}.png".format(submit_dir, dataset.image_info[image_id]["id"]))
 
+        if stats:
+            pred_masks = np.moveaxis(r["masks"], -1, 0)
+            true_masks = np.moveaxis(dataset.load_mask(image_id)[0], -1, 0)
+
+            # Calculate metrics
+            # Keep track of fibers that were detected
+            found_mask_idx = set()
+
+            for i, pmask in enumerate(pred_masks):
+                match = max(true_masks, key=lambda x: iou(pmask, x))
+                found_mask_idx.add(i)
+                val = iou(pmask, match)
+                iou_values.append(val)
+
+            total_fibers += len(true_masks)
+            total_found += len(found_mask_idx)
+
+    # Output metrics
+    if stats:
+        recall = total_found / total_fibers
+        mean_iou = np.mean(iou_values)
+        print("Recall: {}".format(recall))
+        print("Mean IoU: {}".format(mean_iou))
+
     # Save to csv file
     submission = "ImageId,EncodedPixels\n" + "\n".join(submission)
     file_path = os.path.join(submit_dir, "submit.csv")
     with open(file_path, "w") as f:
         f.write(submission)
     print("Saved to ", submit_dir)
-
-# Evaluate metrics
-def evaluate(model, dataset_dir):
-    print("Evaluating metrics")
-
-    def iou(a, b):
-        intersection = (np.logical_and(a, b) == 1).sum()
-        union = (np.logical_or(a, b) == 1).sum()
-        return intersection / union
-
-    # Read dataset
-    dataset = MicrofiberDataset()
-    dataset.load_microfiber(dataset_dir, 'val')
-    dataset.prepare()
-
-    total_fibers = 0
-    total_found = 0
-    iou_values = []
-
-    # Load over images
-    for n, image_id in enumerate(dataset.image_ids):
-        print("Image {} / {}".format(n, len(dataset.image_ids)))
-        # Load image and run detection
-        image = dataset.load_image(image_id)
-        # Detect objects
-        r = model.detect([image], verbose=0)[0]
-        pred_masks = np.moveaxis(r["masks"], -1, 0)
-        true_masks = np.moveaxis(dataset.load_mask(image_id)[0], -1, 0)
-
-        # Keep track of fibers that were detected
-        found_mask_idx = set()
-
-        for i, pmask in enumerate(pred_masks):
-            match = max(true_masks, key=lambda x: iou(pmask, x))
-            found_mask_idx.add(i)
-            val = iou(pmask, match)
-            iou_values.append(val)
-
-        total_fibers += len(true_masks)
-        total_found += len(found_mask_idx)
-
-    recall = total_found / total_fibers
-    mean_iou = np.mean(iou_values)
-    print("Recall: {}".format(recall))
-    print("Mean IoU: {}".format(mean_iou))
 
 
 if __name__ == '__main__':
@@ -478,8 +468,6 @@ if __name__ == '__main__':
         train(model)
     elif args.command == "segment":
         segment(model, dataset_dir=args.dataset)
-    elif args.command == "evaluate":
-        evaluate(model, dataset_dir=args.dataset)
     else:
         print("'{}' is not recognized. "
               "Use 'train' or 'segment'".format(args.command))
